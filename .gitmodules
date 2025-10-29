@@ -10,3 +10,9 @@
 [submodule "robonix/driver/ranger_ros2/src/ugv_sdk"]
 	path = robonix/driver/ranger_ros2/src/ugv_sdk
 	url = https://github.com/enkerewpo/ugv_sdk.git
+[submodule "robonix/driver/piper_ros2/src/piper_ros"]
+	path = robonix/driver/piper_ros2/src/piper_ros
+	url = https://github.com/agilexrobotics/piper_ros.git
+[submodule "robonix/capability/moveit/src/moveit2"]
+	path = robonix/capability/moveit/src/moveit2
+	url = https://github.com/moveit/moveit2.git
