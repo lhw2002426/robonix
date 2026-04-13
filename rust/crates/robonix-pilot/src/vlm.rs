@@ -277,21 +277,68 @@ impl VlmClient {
         agent_node_id: &str,
     ) -> Result<Self> {
         let contract_id = vlm_contract_id_for_query();
-        let mut nodes = if contract_id.is_empty() {
-            let ns_prefix = vlm_query_namespace_prefix();
-            let iface_leaf = vlm_interface_leaf();
-            sdk.query_nodes(&ns_prefix, iface_leaf, "grpc")
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut nodes = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        while std::time::Instant::now() <= deadline {
+            let query_result = if contract_id.is_empty() {
+                let ns_prefix = vlm_query_namespace_prefix();
+                let iface_leaf = vlm_interface_leaf();
+                sdk.query_nodes(&ns_prefix, iface_leaf, "grpc")
+                    .await
+                    .with_context(|| "failed to query nodes (legacy split namespace + name)")
+            } else {
+                sdk.query_nodes_opts(QueryNodesOpts {
+                    contract_id: contract_id.clone(),
+                    transport: "grpc".into(),
+                    ..Default::default()
+                })
                 .await
-                .with_context(|| "failed to query nodes (legacy split namespace + name)")?
-        } else {
-            sdk.query_nodes_opts(QueryNodesOpts {
-                contract_id: contract_id.clone(),
-                transport: "grpc".into(),
-                ..Default::default()
-            })
-            .await
-            .with_context(|| format!("failed to query nodes for contract_id={contract_id}"))?
-        };
+                .with_context(|| format!("failed to query nodes for contract_id={contract_id}"))
+            };
+
+            match query_result {
+                Ok(found) if !found.is_empty() => {
+                    nodes = found;
+                    break;
+                }
+                Ok(_) => {
+                    log::info!(
+                        "no VLM node found yet for contract {} (grpc), retrying...",
+                        if contract_id.is_empty() {
+                            format!("{}+{}", vlm_query_namespace_prefix(), vlm_interface_leaf())
+                        } else {
+                            contract_id.clone()
+                        }
+                    );
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    log::info!(
+                        "VLM discovery failed, retrying: {}",
+                        last_error.as_ref().unwrap()
+                    );
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+
+        if nodes.is_empty() {
+            if let Some(err) = last_error {
+                return Err(err);
+            }
+            return Err(anyhow::anyhow!(
+                "no VLM node for contract {} (grpc). See rust/docs/NAMESPACE.md; \
+                 set ROBONIX_VLM_CONTRACT_ID or use legacy empty contract + ROBONIX_VLM_NAMESPACE_PREFIX.",
+                if contract_id.is_empty() {
+                    format!("{}+{}", vlm_query_namespace_prefix(), vlm_interface_leaf())
+                } else {
+                    contract_id.clone()
+                }
+            ));
+        }
 
         if nodes.len() > 1 {
             nodes.sort_by(|a, b| b.namespace.len().cmp(&a.namespace.len()));

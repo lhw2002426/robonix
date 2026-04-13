@@ -123,6 +123,7 @@ struct MergedConfig {
     runtime: Vec<RuntimeEntry>,
     system: Vec<SystemEntry>,
     packages: Vec<PackageEntry>,
+    rust_workspace: Option<PathBuf>,
     #[allow(dead_code)]
     target: Option<String>,
 }
@@ -138,6 +139,10 @@ fn runtime_cargo_package(name: &str) -> Option<&'static str> {
         "robonix-liaison" => Some("robonix-liaison"),
         _ => None,
     }
+}
+
+fn should_wait_for_runtime_readiness(name: &str) -> bool {
+    name != "robonix-pilot"
 }
 
 /// Spawn a background process.  Returns the Child handle (caller must store it).
@@ -280,6 +285,7 @@ fn load_and_merge(config_path: &Path) -> Result<(MergedConfig, PathBuf)> {
         .unwrap_or_else(|_| base_dir.to_path_buf());
 
     // Load upstream config if specified.
+    let mut rust_workspace = None;
     let upstream = if let Some(ref upstream_path) = cfg.upstream_config {
         let resolved = base_dir.join(upstream_path);
         if resolved.exists() {
@@ -288,10 +294,14 @@ fn load_and_merge(config_path: &Path) -> Result<(MergedConfig, PathBuf)> {
             let up: UpstreamConfig = serde_yaml::from_str(&upstream_content).with_context(|| {
                 format!("failed to parse upstream config {}", resolved.display())
             })?;
+            rust_workspace = resolve_workspace_path(resolved.parent(), up.workspace.as_deref());
             output::sub_step(&format!(
                 "loaded upstream config: {} (workspace: {})",
                 resolved.display(),
-                up.workspace.as_deref().unwrap_or("unnamed")
+                rust_workspace
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "robonix/rust".to_string())
             ));
             up
         } else {
@@ -318,6 +328,7 @@ fn load_and_merge(config_path: &Path) -> Result<(MergedConfig, PathBuf)> {
             runtime: upstream.runtime,
             system: upstream.system,
             packages: cfg.packages,
+            rust_workspace,
             target: cfg.target,
         },
         base_dir,
@@ -385,8 +396,13 @@ pub async fn execute(config_path: &Path) -> Result<()> {
         output::sub_step(&format!("target: {}", target));
     }
 
-    // Detect Rust workspace root for cargo run.
-    let rust_root = detect_rust_root(&base_dir);
+    // Resolve Rust workspace root for cargo run:
+    // 1. `workspace` field from robonix_workspace.yaml, treated as a path
+    // 2. fallback to the bundled `robonix/rust` workspace detection
+    let rust_root = merged
+        .rust_workspace
+        .clone()
+        .or_else(|| detect_rust_root(&base_dir));
 
     // Track all spawned child processes for graceful shutdown.
     let mut children: Vec<Child> = Vec::new();
@@ -438,14 +454,36 @@ pub async fn execute(config_path: &Path) -> Result<()> {
 
                 // Wait for the endpoint to become reachable.
                 if !entry.endpoint.is_empty() {
-                    output::sub_step(&format!("waiting for {} ...", entry.endpoint));
-                    if wait_for_endpoint(&entry.endpoint, Duration::from_secs(15)).await {
-                        output::check(&format!("{} ready at {}", entry.name, entry.endpoint));
+                    if should_wait_for_runtime_readiness(&entry.name) {
+                        output::sub_step(&format!("waiting for {} ...", entry.endpoint));
+                        if wait_for_endpoint(&entry.endpoint, Duration::from_secs(20)).await {
+                            output::check(&format!("{} ready at {}", entry.name, entry.endpoint));
+                        } else {
+                            output::warning(&format!(
+                                "{} started but endpoint {} not reachable after 20s — continuing",
+                                entry.name, entry.endpoint
+                            ));
+                        }
                     } else {
-                        output::warning(&format!(
-                            "{} started but endpoint {} not reachable after 15s — continuing",
+                        output::sub_step(&format!(
+                            "{} readiness check for {} moved to background; continuing deploy so dependent services can start",
                             entry.name, entry.endpoint
                         ));
+                        let runtime_name = entry.name.clone();
+                        let runtime_endpoint = entry.endpoint.clone();
+                        tokio::spawn(async move {
+                            if wait_for_endpoint(&runtime_endpoint, Duration::from_secs(20)).await {
+                                output::check(&format!(
+                                    "{} ready at {}",
+                                    runtime_name, runtime_endpoint
+                                ));
+                            } else {
+                                output::warning(&format!(
+                                    "{} started but endpoint {} not reachable after 20s",
+                                    runtime_name, runtime_endpoint
+                                ));
+                            }
+                        });
                     }
                 } else {
                     sleep(Duration::from_secs(2)).await;
@@ -690,29 +728,53 @@ pub async fn execute(config_path: &Path) -> Result<()> {
 
 /// Walk up from `base` looking for a Cargo workspace containing robonix crates.
 fn detect_rust_root(base: &Path) -> Option<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(workspace_root) = manifest_dir.ancestors().nth(2) {
+        if is_valid_rust_workspace(workspace_root) {
+            return Some(workspace_root.to_path_buf());
+        }
+    }
+
     let mut dir = base.to_path_buf();
     for _ in 0..10 {
-        let candidate = dir.join("Cargo.toml");
-        if candidate.exists() {
-            if let Ok(content) = std::fs::read_to_string(&candidate) {
-                if content.contains("[workspace]") && content.contains("robonix") {
-                    return Some(dir);
-                }
-            }
+        if is_valid_rust_workspace(&dir) {
+            return Some(dir);
         }
-        let rust_candidate = dir.join("rust").join("Cargo.toml");
-        if rust_candidate.exists() {
-            if let Ok(content) = std::fs::read_to_string(&rust_candidate) {
-                if content.contains("[workspace]") && content.contains("robonix") {
-                    return Some(dir.join("rust"));
-                }
-            }
+        let rust_candidate = dir.join("rust");
+        if is_valid_rust_workspace(&rust_candidate) {
+            return Some(rust_candidate);
         }
         if !dir.pop() {
             break;
         }
     }
     None
+}
+
+fn resolve_workspace_path(config_dir: Option<&Path>, workspace: Option<&str>) -> Option<PathBuf> {
+    let workspace = workspace?.trim();
+    if workspace.is_empty() {
+        return None;
+    }
+
+    let candidate = if Path::new(workspace).is_absolute() {
+        PathBuf::from(workspace)
+    } else if let Some(config_dir) = config_dir {
+        config_dir.join(workspace)
+    } else {
+        PathBuf::from(workspace)
+    };
+
+    let candidate = candidate.canonicalize().unwrap_or(candidate);
+    if is_valid_rust_workspace(&candidate) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn is_valid_rust_workspace(dir: &Path) -> bool {
+    dir.join("Cargo.toml").is_file()
 }
 
 /// Try to find the service package under the robonix examples directory.
