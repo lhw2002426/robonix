@@ -124,13 +124,14 @@ pub enum Commands {
         #[arg(short, long)]
         show: bool,
     },
-    /// Run codegen for a package (wraps robonix-codegen + grpc_tools.protoc).
+    /// Run codegen for a package or all workspace packages.
     /// Regenerates robonix_proto, <pkg>/proto_gen/, and optional <pkg>/robonix_mcp_types/.
-    /// Replaces the copy-pasted boilerplate in package build.sh scripts.
+    /// Without -p: reads robonix_workspace.yaml and runs codegen for all packages.
     Codegen {
-        /// Package path (relative to $RBNX_INVOCATION_CWD, else process cwd)
-        #[arg(short = 'p', long, required = true)]
-        package: PathBuf,
+        /// Package path (relative to $RBNX_INVOCATION_CWD, else process cwd).
+        /// Omit to run codegen for all packages in robonix_workspace.yaml.
+        #[arg(short = 'p', long)]
+        package: Option<PathBuf>,
         /// Also generate robonix_mcp_types/ (for MCP-based packages)
         #[arg(long)]
         mcp: bool,
